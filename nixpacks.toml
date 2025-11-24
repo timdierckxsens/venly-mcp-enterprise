@@ -2,7 +2,7 @@
 # Specifies Node.js 20 LTS for the build
 
 [phases.setup]
-nixPkgs = ["nodejs_20", "npm"]
+nixPkgs = ["nodejs_20"]
 
 [phases.install]
 cmds = ["npm install"]
