@@ -1,25 +1,27 @@
 /**
  * server.ts - Production MCP Server with Safety Features
- * 
+ *
  * Enhanced with:
  * - Safe mode for production environments
  * - Health check endpoint with comprehensive status
- * - Audit logging to Google Sheets
+ * - Audit logging
  * - Origin tracking for all operations
  */
 
 import "dotenv/config";
 import express from "express";
 import { z } from "zod";
-import { 
-  McpServer,
-  McpError,
-  ErrorCode,
-} from "@modelcontextprotocol/sdk/server/mcp.js";
+import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
+import {
+  McpError,
+  ErrorCode,
+  CallToolRequestSchema,
+  ListToolsRequestSchema,
+} from "@modelcontextprotocol/sdk/types.js";
 
-import { 
+import {
   VenlyClient,
   VenlyAPIError,
 } from './venlyClient.js';
@@ -61,7 +63,7 @@ let failedTransactions = 0;
 const startTime = new Date();
 
 // Initialize MCP server
-const server = new McpServer(
+const server = new Server(
   {
     name: SERVER_CONFIG.name,
     version: SERVER_CONFIG.version,
@@ -69,7 +71,6 @@ const server = new McpServer(
   {
     capabilities: {
       tools: {},
-      resources: {},
     },
   }
 );
@@ -106,19 +107,19 @@ async function executeWithSafety<T>(
   }
 
   // Execute operation
-  const startTime = Date.now();
+  const opStartTime = Date.now();
   let success = false;
   let error: any = null;
 
   try {
     const result = await operation();
     success = true;
-    
+
     if (options.isFinancial) {
       lastSuccessfulTx = new Date();
       totalTransactions++;
     }
-    
+
     return result;
   } catch (err) {
     error = err;
@@ -133,7 +134,7 @@ async function executeWithSafety<T>(
       toolName,
       action: toolName.replace('venly_', ''),
       status: success ? 'success' : 'failed',
-      duration: Date.now() - startTime,
+      duration: Date.now() - opStartTime,
       walletId: options.walletId,
       amount: options.amount,
       origin: params.origin || 'unknown',
@@ -144,252 +145,332 @@ async function executeWithSafety<T>(
 }
 
 // ====================
-// TREASURY-FOCUSED TOOLS
+// TOOL DEFINITIONS
 // ====================
 
-// High-level treasury operation: Settle Invoice
-server.registerTool(
-  "venly_settle_invoice",
+const TOOLS = [
   {
-    title: "Settle invoice with USDC",
-    description: "High-level operation to settle an invoice using stablecoin from treasury",
-    inputSchema: z.object({
-      invoiceId: z.string().describe("Invoice identifier for tracking"),
-      recipientAddress: z.string().regex(/^0x[a-fA-F0-9]{40}$/),
-      amount: z.string().describe("USDC amount to send"),
-      chain: z.enum(["POLYGON", "BASE", "ETHEREUM"]).default("POLYGON"),
-      memo: z.string().optional(),
-      // Safe mode parameters
-      confirmed: z.boolean().describe("Confirmation flag for production"),
-      origin: z.enum(["n8n", "claude", "internal"]).describe("Origin of request"),
-    }),
-    outputSchema: z.object({
-      success: z.boolean(),
-      transactionHash: z.string().optional(),
-      explorerUrl: z.string().optional(),
-      auditId: z.string(),
-    }),
-    annotations: {
-      ...TOOL_ANNOTATIONS.EXPENSIVE,
-      ...TOOL_ANNOTATIONS.DESTRUCTIVE,
-    },
-  },
-  async (input: any) => {
-    return executeWithSafety(
-      "venly_settle_invoice",
-      input,
-      async () => {
-        // Get treasury wallet ID from config
-        const treasuryWalletId = process.env.TREASURY_WALLET_ID;
-        if (!treasuryWalletId) {
-          throw new McpError(ErrorCode.InvalidRequest, "Treasury wallet not configured");
+    name: "venly_settle_invoice",
+    description: "Settle an invoice using stablecoin (USDC) from treasury wallet",
+    inputSchema: {
+      type: "object",
+      properties: {
+        invoiceId: {
+          type: "string",
+          description: "Invoice identifier for tracking"
+        },
+        recipientAddress: {
+          type: "string",
+          description: "Ethereum address of recipient (0x...)",
+          pattern: "^0x[a-fA-F0-9]{40}$"
+        },
+        amount: {
+          type: "string",
+          description: "USDC amount to send"
+        },
+        chain: {
+          type: "string",
+          enum: ["POLYGON", "BASE", "ETHEREUM"],
+          default: "POLYGON",
+          description: "Blockchain to use"
+        },
+        memo: {
+          type: "string",
+          description: "Optional memo for the transaction"
+        },
+        confirmed: {
+          type: "boolean",
+          description: "Confirmation flag required for production"
+        },
+        origin: {
+          type: "string",
+          enum: ["n8n", "claude", "internal"],
+          description: "Origin of the request"
         }
-
-        // Get USDC contract for chain
-        const usdcContracts: Record<string, string> = {
-          POLYGON: "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174",
-          BASE: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
-          ETHEREUM: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
-        };
-
-        // Execute transfer
-        const result = await venlyClient.executeTransaction({
-          walletId: treasuryWalletId,
-          to: input.recipientAddress,
-          secretType: input.chain,
-          tokenAddress: usdcContracts[input.chain],
-          amount: input.amount,
-          decimals: 6, // USDC has 6 decimals
-        });
-
-        // Wait for confirmation
-        const confirmed = await venlyClient.waitForTransaction({
-          transactionHash: result.transactionHash,
-          secretType: input.chain,
-          timeoutMs: 180000,
-        });
-
-        const explorerUrls: Record<string, string> = {
-          POLYGON: `https://polygonscan.com/tx/${result.transactionHash}`,
-          BASE: `https://basescan.org/tx/${result.transactionHash}`,
-          ETHEREUM: `https://etherscan.io/tx/${result.transactionHash}`,
-        };
-
-        return {
-          success: true,
-          transactionHash: result.transactionHash,
-          explorerUrl: explorerUrls[input.chain],
-          auditId: `INV-${input.invoiceId}-${Date.now()}`,
-        };
       },
-      {
-        isFinancial: true,
-        amount: input.amount,
-        walletId: process.env.TREASURY_WALLET_ID,
-      }
-    );
-  }
-);
-
-// Batch freelancer payouts
-server.registerTool(
-  "venly_batch_payouts",
-  {
-    title: "Execute batch payouts",
-    description: "Process multiple freelancer payouts in a single operation",
-    inputSchema: z.object({
-      payouts: z.array(z.object({
-        recipientAddress: z.string().regex(/^0x[a-fA-F0-9]{40}$/),
-        amount: z.string(),
-        reference: z.string(),
-      })),
-      chain: z.enum(["POLYGON", "BASE"]).default("POLYGON"),
-      confirmed: z.boolean(),
-      origin: z.enum(["n8n", "claude", "internal"]),
-    }),
-    outputSchema: z.object({
-      success: z.boolean(),
-      totalAmount: z.string(),
-      successfulPayouts: z.number(),
-      failedPayouts: z.number(),
-      results: z.array(z.object({
-        reference: z.string(),
-        transactionHash: z.string().optional(),
-        error: z.string().optional(),
-      })),
-    }),
-    annotations: {
-      ...TOOL_ANNOTATIONS.EXPENSIVE,
-      ...TOOL_ANNOTATIONS.DESTRUCTIVE,
-    },
+      required: ["invoiceId", "recipientAddress", "amount", "confirmed", "origin"]
+    }
   },
-  async (input: any) => {
-    // Calculate total amount for safe mode check
-    const totalAmount = input.payouts.reduce(
-      (sum: number, p: any) => sum + parseFloat(p.amount), 
-      0
-    ).toString();
+  {
+    name: "venly_batch_payouts",
+    description: "Execute multiple freelancer payouts in a single batch operation",
+    inputSchema: {
+      type: "object",
+      properties: {
+        payouts: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              recipientAddress: {
+                type: "string",
+                pattern: "^0x[a-fA-F0-9]{40}$"
+              },
+              amount: {
+                type: "string"
+              },
+              reference: {
+                type: "string"
+              }
+            },
+            required: ["recipientAddress", "amount", "reference"]
+          }
+        },
+        chain: {
+          type: "string",
+          enum: ["POLYGON", "BASE"],
+          default: "POLYGON"
+        },
+        confirmed: {
+          type: "boolean"
+        },
+        origin: {
+          type: "string",
+          enum: ["n8n", "claude", "internal"]
+        }
+      },
+      required: ["payouts", "confirmed", "origin"]
+    }
+  },
+  {
+    name: "venly_get_treasury_position",
+    description: "Get comprehensive treasury wallet balances across multiple chains",
+    inputSchema: {
+      type: "object",
+      properties: {
+        chains: {
+          type: "array",
+          items: {
+            type: "string",
+            enum: ["POLYGON", "BASE", "ETHEREUM", "ARBITRUM"]
+          },
+          description: "Chains to query (defaults to POLYGON, BASE, ETHEREUM)"
+        },
+        includeNative: {
+          type: "boolean",
+          default: false,
+          description: "Include native token balances"
+        }
+      }
+    }
+  }
+];
 
-    return executeWithSafety(
-      "venly_batch_payouts",
-      input,
-      async () => {
-        const results = [];
-        let successCount = 0;
-        let failCount = 0;
+// ====================
+// TOOL HANDLERS
+// ====================
 
-        for (const payout of input.payouts) {
-          try {
-            const result = await venlyClient.executeTransaction({
-              walletId: process.env.TREASURY_WALLET_ID!,
-              to: payout.recipientAddress,
-              secretType: input.chain,
-              tokenAddress: input.chain === "POLYGON" 
-                ? "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"  // USDC Polygon
-                : "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913", // USDC Base
-              amount: payout.amount,
-              decimals: 6,
-            });
+// Handler for tools/list
+server.setRequestHandler(ListToolsRequestSchema, async () => {
+  return {
+    tools: TOOLS,
+  };
+});
 
-            results.push({
-              reference: payout.reference,
-              transactionHash: result.transactionHash,
-            });
-            successCount++;
-          } catch (error: any) {
-            results.push({
-              reference: payout.reference,
-              error: error.message,
-            });
-            failCount++;
+// Handler for tools/call
+server.setRequestHandler(CallToolRequestSchema, async (request) => {
+  const { name, arguments: args } = request.params;
+
+  if (!args) {
+    throw new McpError(ErrorCode.InvalidRequest, "Missing arguments");
+  }
+
+  switch (name) {
+    case "venly_settle_invoice":
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              await executeWithSafety(
+                "venly_settle_invoice",
+                args,
+                async () => {
+                  const treasuryWalletId = process.env.TREASURY_WALLET_ID;
+                  if (!treasuryWalletId) {
+                    throw new McpError(ErrorCode.InvalidRequest, "Treasury wallet not configured");
+                  }
+
+                  const usdcContracts: Record<string, string> = {
+                    POLYGON: "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174",
+                    BASE: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+                    ETHEREUM: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
+                  };
+
+                  const result = await venlyClient.executeTransaction({
+                    walletId: treasuryWalletId,
+                    to: args.recipientAddress as string,
+                    secretType: args.chain as string,
+                    tokenAddress: usdcContracts[args.chain as string],
+                    amount: args.amount as string,
+                    decimals: 6,
+                  });
+
+                  await venlyClient.waitForTransaction({
+                    transactionHash: result.transactionHash,
+                    secretType: args.chain as string,
+                    timeoutMs: 180000,
+                  });
+
+                  const explorerUrls: Record<string, string> = {
+                    POLYGON: `https://polygonscan.com/tx/${result.transactionHash}`,
+                    BASE: `https://basescan.org/tx/${result.transactionHash}`,
+                    ETHEREUM: `https://etherscan.io/tx/${result.transactionHash}`,
+                  };
+
+                  return {
+                    success: true,
+                    transactionHash: result.transactionHash,
+                    explorerUrl: explorerUrls[args.chain as string],
+                    auditId: `INV-${args.invoiceId}-${Date.now()}`,
+                  };
+                },
+                {
+                  isFinancial: true,
+                  amount: args.amount as string,
+                  walletId: process.env.TREASURY_WALLET_ID,
+                }
+              ),
+              null,
+              2
+            ),
+          },
+        ],
+      };
+
+    case "venly_batch_payouts":
+      const payouts = args.payouts as Array<{
+        recipientAddress: string;
+        amount: string;
+        reference: string;
+      }>;
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              await executeWithSafety(
+                "venly_batch_payouts",
+                args,
+                async () => {
+                  const totalAmount = payouts.reduce(
+                    (sum, p) => sum + parseFloat(p.amount),
+                    0
+                  ).toString();
+
+                  const results = [];
+                  let successCount = 0;
+                  let failCount = 0;
+
+                  for (const payout of payouts) {
+                    try {
+                      const result = await venlyClient.executeTransaction({
+                        walletId: process.env.TREASURY_WALLET_ID!,
+                        to: payout.recipientAddress,
+                        secretType: args.chain as string,
+                        tokenAddress:
+                          args.chain === "POLYGON"
+                            ? "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+                            : "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+                        amount: payout.amount,
+                        decimals: 6,
+                      });
+
+                      results.push({
+                        reference: payout.reference,
+                        transactionHash: result.transactionHash,
+                      });
+                      successCount++;
+                    } catch (error: any) {
+                      results.push({
+                        reference: payout.reference,
+                        error: error.message,
+                      });
+                      failCount++;
+                    }
+                  }
+
+                  return {
+                    success: failCount === 0,
+                    totalAmount,
+                    successfulPayouts: successCount,
+                    failedPayouts: failCount,
+                    results,
+                  };
+                },
+                {
+                  isFinancial: true,
+                  amount: payouts.reduce((sum: number, p: any) => sum + parseFloat(p.amount), 0).toString(),
+                  walletId: process.env.TREASURY_WALLET_ID,
+                }
+              ),
+              null,
+              2
+            ),
+          },
+        ],
+      };
+
+    case "venly_get_treasury_position":
+      const treasuryWalletId = process.env.TREASURY_WALLET_ID;
+      if (!treasuryWalletId) {
+        throw new McpError(ErrorCode.InvalidRequest, "Treasury wallet not configured");
+      }
+
+      const chains = (args.chains as string[]) || ["POLYGON", "BASE", "ETHEREUM"];
+      const positions = [];
+      let totalUSDC = 0;
+      let totalUSDT = 0;
+
+      for (const chain of chains) {
+        const balances = await venlyClient.getTokenBalances({
+          walletId: treasuryWalletId,
+          secretType: chain,
+        });
+
+        for (const balance of balances.result) {
+          const position = {
+            chain,
+            token: balance.symbol,
+            balance: balance.balance,
+            balanceUSD: balance.symbol.includes("USD") ? balance.balance : undefined,
+          };
+          positions.push(position);
+
+          if (balance.symbol === "USDC") {
+            totalUSDC += parseFloat(balance.balance);
+          } else if (balance.symbol === "USDT") {
+            totalUSDT += parseFloat(balance.balance);
           }
         }
-
-        return {
-          success: failCount === 0,
-          totalAmount,
-          successfulPayouts: successCount,
-          failedPayouts: failCount,
-          results,
-        };
-      },
-      {
-        isFinancial: true,
-        amount: totalAmount,
-        walletId: process.env.TREASURY_WALLET_ID,
       }
-    );
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                totalUSDC: totalUSDC.toString(),
+                totalUSDT: totalUSDT.toString(),
+                positions,
+                lastUpdated: new Date().toISOString(),
+              },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+
+    default:
+      throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${name}`);
   }
-);
-
-// Treasury position query
-server.registerTool(
-  "venly_get_treasury_position",
-  {
-    title: "Get treasury position",
-    description: "Get comprehensive treasury wallet balances across chains",
-    inputSchema: z.object({
-      chains: z.array(z.enum(["POLYGON", "BASE", "ETHEREUM", "ARBITRUM"])).optional(),
-      includeNative: z.boolean().default(false),
-    }),
-    outputSchema: z.object({
-      totalUSDC: z.string(),
-      totalUSDT: z.string(),
-      positions: z.array(z.object({
-        chain: z.string(),
-        token: z.string(),
-        balance: z.string(),
-        balanceUSD: z.string().optional(),
-      })),
-      lastUpdated: z.string(),
-    }),
-    annotations: TOOL_ANNOTATIONS.READ_ONLY,
-  },
-  async (input: any) => {
-    const treasuryWalletId = process.env.TREASURY_WALLET_ID;
-    if (!treasuryWalletId) {
-      throw new McpError(ErrorCode.InvalidRequest, "Treasury wallet not configured");
-    }
-
-    const chains = input.chains || ["POLYGON", "BASE", "ETHEREUM"];
-    const positions = [];
-    let totalUSDC = 0;
-    let totalUSDT = 0;
-
-    for (const chain of chains) {
-      const balances = await venlyClient.getTokenBalances({
-        walletId: treasuryWalletId,
-        secretType: chain,
-      });
-
-      for (const balance of balances.result) {
-        const position = {
-          chain,
-          token: balance.symbol,
-          balance: balance.balance,
-          balanceUSD: balance.symbol.includes("USD") ? balance.balance : undefined,
-        };
-        positions.push(position);
-
-        if (balance.symbol === "USDC") {
-          totalUSDC += parseFloat(balance.balance);
-        } else if (balance.symbol === "USDT") {
-          totalUSDT += parseFloat(balance.balance);
-        }
-      }
-    }
-
-    return {
-      totalUSDC: totalUSDC.toString(),
-      totalUSDT: totalUSDT.toString(),
-      positions,
-      lastUpdated: new Date().toISOString(),
-    };
-  }
-);
+});
 
 // ====================
-// HEALTH ENDPOINT
+// HEALTH ENDPOINT (HTTP MODE)
 // ====================
 
 if (process.argv[2] === 'http') {
@@ -398,7 +479,7 @@ if (process.argv[2] === 'http') {
 
   // Comprehensive health check
   app.get('/healthz', async (req, res) => {
-    const checks = {
+    const checks: any = {
       status: 'healthy',
       version: SERVER_CONFIG.version,
       environment: process.env.VENLY_ENVIRONMENT,
@@ -412,7 +493,7 @@ if (process.argv[2] === 'http') {
       metrics: {
         total_transactions: totalTransactions,
         failed_transactions: failedTransactions,
-        success_rate: totalTransactions > 0 
+        success_rate: totalTransactions > 0
           ? ((totalTransactions - failedTransactions) / totalTransactions * 100).toFixed(2) + '%'
           : 'N/A',
         last_successful_tx: lastSuccessfulTx?.toISOString() || 'none',
@@ -434,10 +515,8 @@ if (process.argv[2] === 'http') {
       checks.checks.audit_logger = 'healthy';
     } catch {
       checks.checks.audit_logger = 'unhealthy';
-      // Don't degrade overall status for audit logger
     }
 
-    // Return appropriate status code
     const statusCode = checks.status === 'healthy' ? 200 : 503;
     res.status(statusCode).json(checks);
   });
@@ -462,7 +541,7 @@ if (process.argv[2] === 'http') {
       </head>
       <body>
         <h1>Venly MCP Treasury Dashboard</h1>
-        
+
         <div class="card">
           <h2>System Status</h2>
           <div class="metric">
@@ -478,7 +557,7 @@ if (process.argv[2] === 'http') {
             <div class="label">Uptime</div>
           </div>
         </div>
-        
+
         <div class="card">
           <h2>Transaction Metrics</h2>
           <div class="metric">
@@ -494,21 +573,21 @@ if (process.argv[2] === 'http') {
             <div class="label">Success Rate</div>
           </div>
         </div>
-        
+
         <div class="card">
           <h2>Safety Features</h2>
           <p>Safe Mode: <span class="status ${safeMode.isEnabled() ? 'healthy' : 'unhealthy'}">${safeMode.isEnabled() ? 'ENABLED' : 'DISABLED'}</span></p>
           <p>Max Transaction: $${process.env.SAFE_MODE_MAX_AMOUNT || '1000'}</p>
           <p>Audit Logging: <span class="status healthy">ENABLED</span></p>
         </div>
-        
+
         <div class="card">
           <h2>Recent Activity</h2>
           <p>Last Successful TX: ${lastSuccessfulTx?.toISOString() || 'None yet'}</p>
         </div>
-        
+
         <script>
-          setInterval(() => location.reload(), 30000); // Auto-refresh every 30s
+          setInterval(() => location.reload(), 30000);
         </script>
       </body>
       </html>
@@ -526,8 +605,8 @@ if (process.argv[2] === 'http') {
 ╔═══════════════════════════════════════════════════════════╗
 ║           Venly MCP Treasury Server Running              ║
 ╠═══════════════════════════════════════════════════════════╣
-║  Environment: ${process.env.VENLY_ENVIRONMENT?.padEnd(43)}║
-║  Safe Mode:   ${safeMode.isEnabled() ? 'ENABLED'.padEnd(43) : 'DISABLED'.padEnd(43)}║
+║  Environment: ${(process.env.VENLY_ENVIRONMENT || '').padEnd(43)}║
+║  Safe Mode:   ${(safeMode.isEnabled() ? 'ENABLED' : 'DISABLED').padEnd(43)}║
 ║  Port:        ${port.toString().padEnd(43)}║
 ║                                                           ║
 ║  Endpoints:                                               ║
