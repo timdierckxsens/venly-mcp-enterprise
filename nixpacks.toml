@@ -1,0 +1,14 @@
+# Nixpacks configuration for Railway
+# Specifies Node.js 20 LTS for the build
+
+[phases.setup]
+nixPkgs = ["nodejs_20", "npm"]
+
+[phases.install]
+cmds = ["npm install"]
+
+[phases.build]
+cmds = ["npm run build"]
+
+[start]
+cmd = "npm run start:http"
